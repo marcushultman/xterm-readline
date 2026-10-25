@@ -81,6 +81,218 @@ test("Ctrl-C away from the end of the line starts the next prompt at column 0", 
   term.dispose();
 });
 
+test("Ctrl-C handler runs during and between reads without changing default reset behavior", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  const handler = jest.fn();
+  term.loadAddon(rl);
+  rl.setCtrlCHandler(handler);
+
+  term.input("\x03");
+  expect(handler).toHaveBeenCalledTimes(1);
+  handler.mockClear();
+
+  const read = rl.read("> ");
+  const settled = jest.fn();
+  void read.then(settled, settled);
+  await drain(term);
+  term.input("abc");
+  term.input("\x03");
+  await drain(term);
+  expect(handler).toHaveBeenCalledTimes(1);
+  expect(settled).not.toHaveBeenCalled();
+  expect(rl.getLine()).toBe("");
+  expect(screen(term, 2)).toEqual(["> abc^C", "> "]);
+
+  term.input("done");
+  term.input("\r");
+  expect(await read).toBe("done");
+  await drain(term);
+  term.input("\x03");
+  expect(handler).toHaveBeenCalledTimes(2);
+  term.dispose();
+});
+
+test("an already-aborted signal rejects without printing or disrupting another read", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const active = rl.read("> ");
+  const controller = new AbortController();
+  const reason = { cancelled: true };
+  controller.abort(reason);
+  await expect(rl.read("unused> ", { signal: controller.signal })).rejects.toBe(reason);
+  await drain(term);
+  expect(screen(term, 1)).toEqual(["> "]);
+  term.input("ok");
+  term.input("\r");
+  expect(await active).toBe("ok");
+  term.dispose();
+});
+
+test("Ctrl-C can abort an active read without resetting its prompt", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const handler = jest.fn(() => controller.abort());
+  rl.setCtrlCHandler(handler);
+  const read = rl.read("> ", { signal: controller.signal });
+  const rejected = expect(read).rejects.toMatchObject({ name: "AbortError" });
+  await drain(term);
+  term.input("abc");
+  term.input("\x03");
+  await rejected;
+  await drain(term);
+  expect(handler).toHaveBeenCalledTimes(1);
+  expect(rl.getLine()).toBe("");
+  expect(screen(term, 2)).toEqual(["> abc", ""]);
+  expect(History.prototype.saveToLocalStorage).not.toHaveBeenCalled();
+  term.dispose();
+});
+
+test("Ctrl-C aborts immediately while the prompt is still queued", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const handler = jest.fn(() => controller.abort());
+  rl.setCtrlCHandler(handler);
+  const read = rl.read("old> ", { signal: controller.signal });
+  const rejected = expect(read).rejects.toBeDefined();
+  term.input("discarded");
+  term.input("\x03");
+  expect(handler).toHaveBeenCalledTimes(1);
+  await rejected;
+  const next = rl.read("new> ");
+  term.input("ok");
+  await drain(term);
+  expect(screen(term, 2)).toEqual(["new> ok", ""]);
+  term.input("\r");
+  expect(await next).toBe("ok");
+  term.dispose();
+});
+
+test("abort during prompt output drops queued input and stale callbacks", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const read = rl.read("old> ", { signal: controller.signal });
+  const rejected = expect(read).rejects.toBe(null);
+  term.input("discarded");
+  // Runs after the initial flush callback has queued the prompt output, but
+  // before its completion callback initializes editing.
+  term.write("", () => controller.abort(null));
+  await rejected;
+  const next = rl.read("new> ");
+  term.input("ok");
+  await drain(term);
+  expect(screen(term, 1)).toEqual(["old> new> ok"]);
+  expect(rl.getLine()).toBe("ok");
+  term.input("\r");
+  expect(await next).toBe("ok");
+  term.dispose();
+});
+
+test("completion removes the abort listener and isolates the next read", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const remove = jest.spyOn(controller.signal, "removeEventListener");
+  const first = rl.read("> ", { signal: controller.signal });
+  await drain(term);
+  term.input("one");
+  term.input("\r");
+  expect(await first).toBe("one");
+  expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+  const next = rl.read("> ");
+  controller.abort();
+  await drain(term);
+  term.input("two");
+  term.input("\r");
+  expect(await next).toBe("two");
+  term.dispose();
+});
+
+test("a non-aborting Ctrl-C handler runs once when the prompt is queued", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  const handler = jest.fn();
+  term.loadAddon(rl);
+  rl.setCtrlCHandler(handler);
+  const read = rl.read("> ");
+  term.input("\x03");
+  expect(handler).toHaveBeenCalledTimes(1);
+  await drain(term);
+  expect(handler).toHaveBeenCalledTimes(1);
+  expect(screen(term, 2)).toEqual(["> ^C", "> "]);
+  term.input("ok");
+  term.input("\r");
+  expect(await read).toBe("ok");
+  term.dispose();
+});
+
+test("a Ctrl-C handler can abort and synchronously start a replacement read", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const read = rl.read("old> ", { signal: controller.signal });
+  const rejected = expect(read).rejects.toBeDefined();
+  let replacement: Promise<string> | undefined;
+  rl.setCtrlCHandler(() => {
+    controller.abort();
+    replacement = rl.read("new> ");
+  });
+  term.input("\x03");
+  await rejected;
+  await drain(term);
+  expect(screen(term, 1)).toEqual(["new> "]);
+  term.input("ok");
+  term.input("\r");
+  expect(await replacement).toBe("ok");
+  term.dispose();
+});
+
+test("abort during Ctrl-L redraw prevents the abandoned prompt from returning", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const read = rl.read("old> ", { signal: controller.signal });
+  const rejected = expect(read).rejects.toBeDefined();
+  await drain(term);
+  term.input("abc");
+  term.input("\x0c");
+  controller.abort();
+  await rejected;
+  const next = rl.read("new> ");
+  await drain(term);
+  expect(screen(term, 2)).toEqual(["new> ", ""]);
+  term.input("\r");
+  expect(await next).toBe("");
+  term.dispose();
+});
+
+test("aborting removes its listener and a concurrent read cannot orphan it", async () => {
+  const term = new Terminal({ cols: 40, rows: 8 });
+  const rl = new Readline();
+  term.loadAddon(rl);
+  const controller = new AbortController();
+  const remove = jest.spyOn(controller.signal, "removeEventListener");
+  const first = rl.read("> ", { signal: controller.signal });
+  const rejected = expect(first).rejects.toBe("cancelled");
+  await expect(rl.read("other> ")).rejects.toThrow("a read is already active");
+  controller.abort("cancelled");
+  await rejected;
+  expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+  await drain(term);
+  expect(screen(term, 1)).toEqual([""]);
+  term.dispose();
+});
+
 test.each([40, 21, 20, 19])(
   "emoji prompt agrees with xterm before and after Backspace at %i columns",
   async (cols) => {
@@ -216,7 +428,8 @@ test("re-activating on another terminal mid-prompt does not swallow input", asyn
   await drain(first);
   second.input("\x03");
   await drain(second);
-  expect(screen(second, 2)).toEqual(["> ^C", "> "]);
+  // The first terminal's queued prompt must not leak onto the second.
+  expect(screen(second, 2)).toEqual(["^C", "> "]);
   expect(second.buffer.active.cursorX).toBe(2);
   first.dispose();
   second.dispose();
